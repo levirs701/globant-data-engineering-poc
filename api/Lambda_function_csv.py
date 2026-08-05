@@ -4,6 +4,7 @@ import csv
 import io
 import logging
 from datetime import datetime
+from analytics import query_quarterly_hiring, query_top_departments,parse_data_api_response
 
 # Configurar el logger oficial de AWS Lambda
 logger = logging.getLogger()
@@ -110,46 +111,132 @@ def insert_single_row(row: dict, table: str) -> bool:
         return False
 
 def lambda_handler(event, context):
-    query_params = event.get("queryStringParameters") or {}
-    table = query_params.get("table")
-    
-    if table not in ["hired_employees", "jobs", "departments"]:
-        return {"statusCode": 400, "body": json.dumps({"error": "Invalid or missing '?table=' parameter"})}
+    # 1. Detectar el método HTTP y la ruta de la solicitud (Soporta API Gateway / Function URL)
+    http_method = event.get('requestContext', {}).get('http', {}).get('method', event.get('httpMethod', 'POST'))
+    path = event.get('rawPath', event.get('path', ''))
 
-    csv_content = event.get("body", "")
-    if not csv_content:
-        return {"statusCode": 400, "body": json.dumps({"error": "Empty CSV body"})}
+    # =========================================================================
+    # --- CHALLENGE #2: NUEVOS ENDPOINTS ANALÍTICOS (GET) ---
+    # =========================================================================
+    if http_method == 'GET':
+        try:
+            if path == '/analytics/quarterly-hiring':
+                # 1. Llamada directa a la API de AWS
+                response = rds_client.execute_statement(
+                    resourceArn=CLUSTER_ARN,
+                    secretArn=SECRET_ARN,
+                    database=DATABASE_NAME,
+                    includeResultMetadata=True,
+                    sql="""SELECT 
+                            d.department AS department,
+                            j.job AS job,
+                            COUNT(CASE WHEN EXTRACT(QUARTER FROM CAST(he.datetime AS TIMESTAMP)) = 1 THEN 1 END) AS q1,
+                            COUNT(CASE WHEN EXTRACT(QUARTER FROM CAST(he.datetime AS TIMESTAMP)) = 2 THEN 1 END) AS q2,
+                            COUNT(CASE WHEN EXTRACT(QUARTER FROM CAST(he.datetime AS TIMESTAMP)) = 3 THEN 1 END) AS q3,
+                            COUNT(CASE WHEN EXTRACT(QUARTER FROM CAST(he.datetime AS TIMESTAMP)) = 4 THEN 1 END) AS q4
+                            FROM hired_employees he
+                            INNER JOIN departments d ON he.department_id = d.id
+                            INNER JOIN jobs j ON he.job_id = j.id
+                            WHERE EXTRACT(YEAR FROM CAST(he.datetime AS TIMESTAMP)) = 2021
+                            GROUP BY d.department, j.job
+                            ORDER BY d.department ASC, j.job ASC;"""
+                )
+            
+                clean_data = parse_data_api_response(response)
 
-    # Forzar la lectura con las columnas fijas inyectadas directamente mediante fieldnames
-    csv_file = io.StringIO(csv_content.strip())
-    explicit_headers = TABLE_HEADERS[table]
-    reader = list(csv.DictReader(csv_file, fieldnames=explicit_headers))
-    
-    if len(reader) > 1000:
-        return {"statusCode": 400, "body": json.dumps({"error": "The CSV file exceeds the limit of 1000 rows"})}
+                # 2. Retornamos la respuesta cruda de AWS sin manipularla
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps(clean_data, default=str)
+                }
+                
+            elif path == '/analytics/top-departments':
+                data = query_top_departments()
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps(data, default=str)
+                }
+                
+            elif path == '/analytics/test-db':
+                # Una consulta ultra simple que solo cuenta cuántos registros hay en la tabla
+                sql_test = "SELECT COUNT(*) AS total FROM hired_em ployees;"
+                res = rds_client.execute_statement(
+                    resourceArn=CLUSTER_ARN,
+                    secretArn=SECRET_ARN,
+                    database=DATABASE_NAME,
+                    sql=sql_test
+                )
+                # Devolvemos la respuesta cruda de AWS para ver cómo viene estructurada
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps(res, default=str)
+                }
+            
+            else:
+                return {
+                    "statusCode": 404,
+                    "body": json.dumps({"error": f"Ruta analítica '{path}' no encontrada."})
+                }
+        except Exception as e:
+            return {
+                "statusCode": 500,
+                "body": json.dumps({"error": f"Error al procesar consulta analítica: {str(e)}"})
+            }
 
-    inserted_rows_count = 0
-    failed_rows_count = 0
-    
-    for idx, row in enumerate(reader):
-        is_valid, reason, cleaned_data = clean_and_validate_row(row, table)
+    # =========================================================================
+    # --- CHALLENGE #1: LOGICA EXISTENTE PARA CARGA DE CSV (POST) ---
+    # =========================================================================
+    elif http_method == 'POST':
+        query_params = event.get("queryStringParameters") or {}
+        table = query_params.get("table")
         
-        if is_valid:
-            success = insert_single_row(cleaned_data, table)
-            if success:
-                inserted_rows_count += 1
+        if table not in ["hired_employees", "jobs", "departments"]:
+            return {"statusCode": 400, "body": json.dumps({"error": "Invalid or missing '?table=' parameter"})}
+
+        csv_content = event.get("body", "")
+        if not csv_content:
+            return {"statusCode": 400, "body": json.dumps({"error": "Empty CSV body"})}
+
+        # Forzar la lectura con las columnas fijas inyectadas directamente mediante fieldnames
+        csv_file = io.StringIO(csv_content.strip())
+        explicit_headers = TABLE_HEADERS[table]
+        reader = list(csv.DictReader(csv_file, fieldnames=explicit_headers))
+        
+        if len(reader) > 1000:
+            return {"statusCode": 400, "body": json.dumps({"error": "The CSV file exceeds the limit of 1000 rows"})}
+
+        inserted_rows_count = 0
+        failed_rows_count = 0
+        
+        for idx, row in enumerate(reader):
+            is_valid, reason, cleaned_data = clean_and_validate_row(row, table)
+            
+            if is_valid:
+                # Nota: insert_single_row debe gestionar su propia apertura/cierre de conexión
+                success = insert_single_row(cleaned_data, table)
+                if success:
+                    inserted_rows_count += 1
+                else:
+                    failed_rows_count += 1
             else:
                 failed_rows_count += 1
-        else:
-            failed_rows_count += 1
-            logger.warning(f"[INVALID RECORD LOGGED] Table: {table} | Row: {idx} | Reason: {reason} | Data: {row}")
+                logger.warning(f"[INVALID RECORD LOGGED] Table: {table} | Row: {idx} | Reason: {reason} | Data: {row}")
 
+        return {
+            "statusCode": 201,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "status": "Batch processed inline with static schema",
+                "inserted_rows": inserted_rows_count,
+                "failed_rows_logged": failed_rows_count
+            })
+        }
+
+    # Si se invoca con otro método no soportado (PUT, DELETE, etc.)
     return {
-        "statusCode": 201,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({
-            "status": "Batch processed inline with static schema",
-            "inserted_rows": inserted_rows_count,
-            "failed_rows_logged": failed_rows_count
-        })
+        "statusCode": 405,
+        "body": json.dumps({"error": f"Method {http_method} not allowed"})
     }
